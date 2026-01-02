@@ -70,11 +70,14 @@ func (s *Store) Upload(filename string, data []byte) error {
 	defer cancel()
 
 	key := s.prefix + "/" + filename
+	length := int64(len(data))
+	reader := bytes.NewReader(data)
 
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-		Body:   io.NopCloser(io.Reader(bytes.NewReader(data))),
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          reader,
+		ContentLength: &length,
 	})
 
 	return err

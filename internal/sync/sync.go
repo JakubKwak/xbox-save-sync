@@ -8,6 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
 	"time"
 )
 
@@ -24,7 +28,7 @@ type Syncer struct {
 }
 
 type metadata struct {
-	games map[string]time.Time
+	Games map[string]time.Time `json:"games"`
 }
 
 func New(store store, savePath string) *Syncer {
@@ -43,9 +47,9 @@ func (s *Syncer) Sync() error {
 	}
 
 	// Sync games already in cloud
-	for game, cloudVer := range metaCloud.games {
+	for game, cloudVer := range metaCloud.Games {
 		var localVer *time.Time
-		if ver, ok := metaLocal.games[game]; ok {
+		if ver, ok := metaLocal.Games[game]; ok {
 			localVer = &ver
 		}
 		newVer, err := s.syncGame(game, &cloudVer, localVer)
@@ -54,8 +58,8 @@ func (s *Syncer) Sync() error {
 		}
 
 		if newVer != nil {
-			metaCloud.games[game] = *newVer
-			metaLocal.games[game] = *newVer
+			metaCloud.Games[game] = *newVer
+			metaLocal.Games[game] = *newVer
 		}
 
 		// Sync metadata between each operation in case of error
@@ -78,7 +82,7 @@ func (s *Syncer) Sync() error {
 		}
 		game := entry.Name()
 
-		if _, ok := metaCloud.games[game]; ok {
+		if _, ok := metaCloud.Games[game]; ok {
 			continue // already exists in cloud
 		}
 
@@ -88,8 +92,8 @@ func (s *Syncer) Sync() error {
 			return err
 		}
 		if newVer != nil {
-			metaCloud.games[game] = *newVer
-			metaLocal.games[game] = *newVer
+			metaCloud.Games[game] = *newVer
+			metaLocal.Games[game] = *newVer
 		}
 		if err := s.writeMetaCloud(metaCloud); err != nil {
 			return err
@@ -133,20 +137,22 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 
 		for {
 			text, _ := reader.ReadString('\n')
-			switch text {
-			case "Y":
+			text = strings.ToUpper(text)
+			character := text[0]
+			switch character {
+			case 'Y':
 				if err := s.downloadGame(game); err != nil {
 					return nil, err
 				}
 
 				return cloudVer, nil
-			case "X":
+			case 'X':
 				if err := s.uploadGame(game); err != nil {
 					return nil, err
 				}
 				ver := time.Now()
 				return &ver, nil
-			case "B":
+			case 'B':
 				return nil, nil
 			default:
 				fmt.Printf("Unknown input: %s", text)
@@ -160,11 +166,11 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 func (s *Syncer) uploadGame(game string) error {
 	fmt.Println("Uploading...")
 
-	saveDir := filepath.Join(s.savePath, metaFileName)
+	saveDir := filepath.Join(s.savePath, game)
 
 	data, err := zipDir(saveDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot zip save: %w", err)
 	}
 
 	fmt.Println("Done.")
@@ -177,7 +183,7 @@ func (s *Syncer) downloadGame(game string) error {
 
 	zipData, err := s.store.Download(game + ".zip")
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot download save: %w", err)
 	}
 
 	targetDir := filepath.Join(s.savePath, game)
@@ -185,12 +191,12 @@ func (s *Syncer) downloadGame(game string) error {
 	// We extract to a temporary folder first to avoid corrupting local saves if sync breaks midway
 	tmpDir, err := os.MkdirTemp(s.savePath, game+"-tmp-")
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot make temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	if err := unzip(zipData, tmpDir); err != nil {
-		return err
+		return fmt.Errorf("cannot unzip save: %w", err)
 	}
 
 	backupDir := targetDir + ".bak"
@@ -199,14 +205,14 @@ func (s *Syncer) downloadGame(game string) error {
 	// Move existing save to backup dir
 	if _, err := os.Stat(targetDir); err == nil {
 		if err := os.Rename(targetDir, backupDir); err != nil {
-			return err
+			return fmt.Errorf("cannot backup save: %w", err)
 		}
 	}
 
 	// Move new save into place
 	if err := os.Rename(tmpDir, targetDir); err != nil {
 		_ = os.Rename(backupDir, targetDir)
-		return err
+		return fmt.Errorf("cannot move new save: %w", err)
 	}
 
 	_ = os.RemoveAll(backupDir)
@@ -218,15 +224,16 @@ func (s *Syncer) downloadGame(game string) error {
 func (s *Syncer) readMetaLocal() (metadata, error) {
 	file, err := os.Open(filepath.Join(s.savePath, metaFileName))
 	if err != nil {
-		return metadata{games: map[string]time.Time{}}, err
+		fmt.Println("Could not find/open metadata file, creating new one")
+		return metadata{Games: map[string]time.Time{}}, nil
 	}
 
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return metadata{games: map[string]time.Time{}}, err
+		return metadata{Games: map[string]time.Time{}}, err
 	}
 
-	meta := metadata{games: map[string]time.Time{}}
+	meta := metadata{Games: map[string]time.Time{}}
 	err = json.Unmarshal(data, &meta)
 
 	return meta, err
@@ -235,10 +242,16 @@ func (s *Syncer) readMetaLocal() (metadata, error) {
 func (s *Syncer) readMetaCloud() (metadata, error) {
 	data, err := s.store.Download(metaFileName)
 	if err != nil {
-		return metadata{}, err
+		var noSuchKey *s3types.NoSuchKey // todo not generic
+		if errors.As(err, &noSuchKey) {
+			fmt.Println("Metadata does not exist yet:", metaFileName)
+			return metadata{Games: map[string]time.Time{}}, nil
+		}
+
+		return metadata{Games: map[string]time.Time{}}, err
 	}
 
-	var meta metadata
+	meta := metadata{Games: map[string]time.Time{}}
 	err = json.Unmarshal(data, &meta)
 
 	return meta, err
