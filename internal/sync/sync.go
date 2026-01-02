@@ -17,6 +17,8 @@ import (
 
 const metaFileName string = "meta.json"
 
+const baseGameId string = "FFFE07D1"
+
 type store interface {
 	Download(filename string) ([]byte, error)
 	Upload(filename string, data []byte) error
@@ -56,6 +58,10 @@ func (s *Syncer) Sync() error {
 			continue
 		}
 		game := entry.Name()
+		if game == baseGameId {
+			// base xbox profile game id, reserved for accounts info, skip
+			continue
+		}
 		if _, ok := metaLocal.Games[game]; !ok {
 			metaLocal.Games[game] = time.Time{}
 		}
@@ -63,6 +69,11 @@ func (s *Syncer) Sync() error {
 
 	// Sync games already in cloud
 	for game, cloudVer := range metaCloud.Games {
+		if game == baseGameId {
+			// base xbox profile game id, reserved for accounts info, skip
+			continue
+		}
+
 		var localVer *time.Time
 		if ver, ok := metaLocal.Games[game]; ok {
 			localVer = &ver
@@ -163,8 +174,6 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 			fmt.Printf("Unknown input: %s", text)
 		}
 	}
-
-	return nil, nil
 }
 
 func (s *Syncer) uploadGame(game string) error {
