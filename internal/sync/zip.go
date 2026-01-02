@@ -26,6 +26,7 @@ func zipDir(root string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
+		relPath = filepath.ToSlash(relPath)
 
 		file, err := os.Open(path)
 		if err != nil {
@@ -61,7 +62,9 @@ func unzip(data []byte, dest string) error {
 	}
 
 	for _, file := range reader.File {
-		path := filepath.Join(dest, file.Name)
+		// Convert ZIP path separators to OS-specific ones
+		cleanName := filepath.FromSlash(file.Name)
+		path := filepath.Join(dest, cleanName)
 
 		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
 			return fmt.Errorf("illegal file path: %s", file.Name)
