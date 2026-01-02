@@ -22,7 +22,7 @@ type Store struct {
 
 func New(bucket string, prefix string, region string) (*Store, error) {
 	ctx := context.Background()
-	// TODO configure
+
 	sdkConfig, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, err
