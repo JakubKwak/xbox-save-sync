@@ -46,6 +46,21 @@ func (s *Syncer) Sync() error {
 		return err
 	}
 
+	// Read local folders - if any game does not exist in the local meta.json add it
+	entires, err := os.ReadDir(s.savePath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entires {
+		if !entry.IsDir() {
+			continue
+		}
+		game := entry.Name()
+		if _, ok := metaLocal.Games[game]; !ok {
+			metaLocal.Games[game] = time.Time{}
+		}
+	}
+
 	// Sync games already in cloud
 	for game, cloudVer := range metaCloud.Games {
 		var localVer *time.Time
@@ -70,31 +85,22 @@ func (s *Syncer) Sync() error {
 			return err
 		}
 	}
-
-	// Sync local games not in cloud
-	entires, err := os.ReadDir(s.savePath)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entires {
-		if !entry.IsDir() {
-			continue
-		}
-		game := entry.Name()
-
+	// Sync remaining local games
+	for game, localVer := range metaLocal.Games {
 		if _, ok := metaCloud.Games[game]; ok {
-			continue // already exists in cloud
+			continue // If already exists in cloud saves, skip it
 		}
-
-		ver := time.Now()
-		newVer, err := s.syncGame(game, nil, &ver)
+		newVer, err := s.syncGame(game, nil, &localVer)
 		if err != nil {
 			return err
 		}
+
 		if newVer != nil {
 			metaCloud.Games[game] = *newVer
 			metaLocal.Games[game] = *newVer
 		}
+
+		// Sync metadata between each operation in case of error
 		if err := s.writeMetaCloud(metaCloud); err != nil {
 			return err
 		}
@@ -121,7 +127,7 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 		return cloudVer, nil
 	}
 
-	if cloudVer == nil {
+	if cloudVer == nil || cloudVer.Format(time.RFC3339) == localVer.Format(time.RFC3339) {
 		if err := s.uploadGame(game); err != nil {
 			return nil, err
 		}
@@ -130,33 +136,31 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 		return &ver, nil
 	}
 
-	if cloudVer != localVer {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Printf("Version mismatch - Local: %s, Cloud: %s\n", localVer.Format(time.RFC1123), cloudVer.Format(time.RFC1123))
-		fmt.Println("Download (Y) - Upload (X) - Cancel (B)")
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("Version mismatch - Local: %s, Cloud: %s\n", localVer.Format(time.RFC1123), cloudVer.Format(time.RFC1123))
+	fmt.Println("Download (Y) - Upload (X) - Cancel (B)")
 
-		for {
-			text, _ := reader.ReadString('\n')
-			text = strings.ToUpper(text)
-			character := text[0]
-			switch character {
-			case 'Y':
-				if err := s.downloadGame(game); err != nil {
-					return nil, err
-				}
-
-				return cloudVer, nil
-			case 'X':
-				if err := s.uploadGame(game); err != nil {
-					return nil, err
-				}
-				ver := time.Now()
-				return &ver, nil
-			case 'B':
-				return nil, nil
-			default:
-				fmt.Printf("Unknown input: %s", text)
+	for {
+		text, _ := reader.ReadString('\n')
+		text = strings.ToUpper(text)
+		character := text[0]
+		switch character {
+		case 'Y':
+			if err := s.downloadGame(game); err != nil {
+				return nil, err
 			}
+
+			return cloudVer, nil
+		case 'X':
+			if err := s.uploadGame(game); err != nil {
+				return nil, err
+			}
+			ver := time.Now()
+			return &ver, nil
+		case 'B':
+			return nil, nil
+		default:
+			fmt.Printf("Unknown input: %s", text)
 		}
 	}
 
