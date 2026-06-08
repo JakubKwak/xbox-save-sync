@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"xbox-save-sync/internal/mapping"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -67,7 +68,17 @@ func (s *Syncer) Sync() error {
 		}
 	}
 
-	// Sync games already in cloud
+	if err := s.syncExisting(&metaCloud, &metaLocal); err != nil {
+		return err
+	}
+	if err := s.syncNew(&metaCloud, &metaLocal); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Syncer) syncExisting(metaCloud, metaLocal *metadata) error {
 	for game, cloudVer := range metaCloud.Games {
 		if game == baseGameId {
 			// base xbox profile game id, reserved for accounts info, skip
@@ -89,14 +100,18 @@ func (s *Syncer) Sync() error {
 		}
 
 		// Sync metadata between each operation in case of error
-		if err := s.writeMetaCloud(metaCloud); err != nil {
+		if err := s.writeMetaCloud(*metaCloud); err != nil {
 			return err
 		}
-		if err := s.writeMetaLocal(metaLocal); err != nil {
+		if err := s.writeMetaLocal(*metaLocal); err != nil {
 			return err
 		}
 	}
-	// Sync remaining local games
+
+	return nil
+}
+
+func (s *Syncer) syncNew(metaCloud, metaLocal *metadata) error {
 	for game, localVer := range metaLocal.Games {
 		if _, ok := metaCloud.Games[game]; ok {
 			continue // If already exists in cloud saves, skip it
@@ -112,10 +127,10 @@ func (s *Syncer) Sync() error {
 		}
 
 		// Sync metadata between each operation in case of error
-		if err := s.writeMetaCloud(metaCloud); err != nil {
+		if err := s.writeMetaCloud(*metaCloud); err != nil {
 			return err
 		}
-		if err := s.writeMetaLocal(metaLocal); err != nil {
+		if err := s.writeMetaLocal(*metaLocal); err != nil {
 			return err
 		}
 	}
@@ -124,7 +139,7 @@ func (s *Syncer) Sync() error {
 }
 
 func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time) (*time.Time, error) {
-	fmt.Println("Syncing game " + game)
+	fmt.Println("Syncing game " + mapping.Title(game))
 
 	if cloudVer == nil && localVer == nil {
 		return nil, errors.New("both cloud and local saves lack version")
