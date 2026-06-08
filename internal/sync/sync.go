@@ -154,6 +154,13 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 	}
 
 	if cloudVer == nil || cloudVer.Format(time.RFC3339) == localVer.Format(time.RFC3339) {
+		saveDir := filepath.Join(s.savePath, game)
+		latestLocalWrite, err := getLatestModTime(saveDir)
+		if err == nil && localVer != nil && !latestLocalWrite.After(*localVer) {
+			fmt.Println("No change detected for " + mapping.Title(game) + ". Skipping.")
+			return localVer, nil
+		}
+
 		if err := s.uploadGame(game); err != nil {
 			return nil, err
 		}
@@ -301,4 +308,22 @@ func (s *Syncer) writeMetaLocal(meta metadata) error {
 	}
 
 	return os.WriteFile(filepath.Join(s.savePath, metaFileName), data, 0666)
+}
+
+func getLatestModTime(dirPath string) (time.Time, error) {
+	var latest time.Time
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			if info.ModTime().After(latest) {
+				latest = info.ModTime()
+			}
+		}
+		return nil
+	})
+
+	return latest, err
 }
