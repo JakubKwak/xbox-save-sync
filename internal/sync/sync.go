@@ -24,9 +24,33 @@ type store interface {
 	Upload(filename string, data []byte) error
 }
 
+type ConflictChoice int
+
+const (
+	ChoiceDownload ConflictChoice = iota
+	ChoiceUpload
+	ChoiceSkip
+)
+
+type ConflictInfo struct {
+	GameID    string
+	Title     string
+	LocalTime time.Time
+	CloudTime time.Time
+}
+
+type ConflictResolver func(info ConflictInfo) (ConflictChoice, error)
+
+type Logger func(format string, args ...any)
+
+type ProgressCallback func(gameTitle string, action string)
+
 type Syncer struct {
-	store    store
-	savePath string
+	store            store
+	savePath         string
+	logFn            Logger
+	conflictResolver ConflictResolver
+	progressFn       ProgressCallback
 }
 
 type metadata struct {
@@ -35,6 +59,32 @@ type metadata struct {
 
 func New(store store, savePath string) *Syncer {
 	return &Syncer{store: store, savePath: savePath}
+}
+
+func (s *Syncer) SetLogger(l Logger) {
+	s.logFn = l
+}
+
+func (s *Syncer) SetConflictResolver(r ConflictResolver) {
+	s.conflictResolver = r
+}
+
+func (s *Syncer) SetProgressCallback(p ProgressCallback) {
+	s.progressFn = p
+}
+
+func (s *Syncer) log(format string, args ...any) {
+	if s.logFn != nil {
+		s.logFn(format, args...)
+	} else {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
+func (s *Syncer) progress(gameTitle string, action string) {
+	if s.progressFn != nil {
+		s.progressFn(gameTitle, action)
+	}
 }
 
 func isGameDir(name string) bool {
@@ -191,7 +241,8 @@ func (s *Syncer) syncNew(metaCloud, metaLocal *metadata) error {
 
 func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time) (*time.Time, error) {
 	title := mapping.Title(game)
-	fmt.Println("Syncing game " + title)
+	s.log("Syncing game %s", title)
+	s.progress(title, "Checking...")
 
 	saveDir := filepath.Join(s.savePath, game)
 	latestLocalWrite, err := getLatestModTime(saveDir)
@@ -203,20 +254,24 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 	if hasCloud && (!hasLocalFiles || !hasLocalVer) {
 		if hasLocalFiles {
 			// Both exist, but this device hasn't synced with cloud before. Prompt conflict resolution.
-			return s.promptResolveConflict(game, title, latestLocalWrite, *cloudVer)
+			return s.resolveConflict(game, title, latestLocalWrite, *cloudVer)
 		}
+		s.progress(title, "Downloading...")
 		if err := s.downloadGame(game, cloudVer); err != nil {
 			return nil, err
 		}
+		s.progress(title, "Downloaded")
 		return cloudVer, nil
 	}
 
 	// Case 2: Game exists only locally (new game, no cloud save yet)
 	if !hasCloud && hasLocalFiles {
+		s.progress(title, "Uploading...")
 		if err := s.uploadGame(game); err != nil {
 			return nil, err
 		}
 		ver := time.Now().UTC()
+		s.progress(title, "Uploaded")
 		return &ver, nil
 	}
 
@@ -230,27 +285,68 @@ func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time)
 	cloudChanged := !cloudVer.Equal(*localVer)
 
 	if !localModified && !cloudChanged {
-		fmt.Println("No change detected for " + title + ". Skipping.")
+		s.log("No change detected for %s. Skipping.", title)
+		s.progress(title, "Up to date")
 		return nil, nil
 	}
 
 	if localModified && !cloudChanged {
+		s.progress(title, "Uploading...")
 		if err := s.uploadGame(game); err != nil {
 			return nil, err
 		}
 		ver := time.Now().UTC()
+		s.progress(title, "Uploaded")
 		return &ver, nil
 	}
 
 	if !localModified && cloudChanged {
+		s.progress(title, "Downloading...")
 		if err := s.downloadGame(game, cloudVer); err != nil {
 			return nil, err
 		}
+		s.progress(title, "Downloaded")
 		return cloudVer, nil
 	}
 
 	// True conflict: both modified since last sync
-	return s.promptResolveConflict(game, title, latestLocalWrite, *cloudVer)
+	return s.resolveConflict(game, title, latestLocalWrite, *cloudVer)
+}
+
+func (s *Syncer) resolveConflict(game, title string, localTime, cloudTime time.Time) (*time.Time, error) {
+	if s.conflictResolver != nil {
+		choice, err := s.conflictResolver(ConflictInfo{
+			GameID:    game,
+			Title:     title,
+			LocalTime: localTime,
+			CloudTime: cloudTime,
+		})
+		if err != nil {
+			return nil, err
+		}
+		switch choice {
+		case ChoiceDownload:
+			s.progress(title, "Downloading...")
+			if err := s.downloadGame(game, &cloudTime); err != nil {
+				return nil, err
+			}
+			s.progress(title, "Downloaded")
+			return &cloudTime, nil
+		case ChoiceUpload:
+			s.progress(title, "Uploading...")
+			if err := s.uploadGame(game); err != nil {
+				return nil, err
+			}
+			ver := time.Now().UTC()
+			s.progress(title, "Uploaded")
+			return &ver, nil
+		case ChoiceSkip:
+			s.log("Skipped %s.", title)
+			s.progress(title, "Skipped")
+			return nil, nil
+		}
+	}
+	return s.promptResolveConflict(game, title, localTime, cloudTime)
 }
 
 func (s *Syncer) promptResolveConflict(game, title string, localTime, cloudTime time.Time) (*time.Time, error) {
@@ -293,7 +389,8 @@ func (s *Syncer) promptResolveConflict(game, title string, localTime, cloudTime 
 }
 
 func (s *Syncer) uploadGame(game string) error {
-	fmt.Println("Uploading...")
+	title := mapping.Title(game)
+	s.log("Uploading %s...", title)
 
 	saveDir := filepath.Join(s.savePath, game)
 
@@ -306,12 +403,13 @@ func (s *Syncer) uploadGame(game string) error {
 		return fmt.Errorf("cannot upload save: %w", err)
 	}
 
-	fmt.Println("Done.")
+	s.log("Uploaded %s successfully.", title)
 	return nil
 }
 
 func (s *Syncer) downloadGame(game string, cloudVer *time.Time) error {
-	fmt.Println("Downloading...")
+	title := mapping.Title(game)
+	s.log("Downloading %s...", title)
 
 	zipData, err := s.store.Download(game + ".zip")
 	if err != nil {
@@ -364,7 +462,7 @@ func (s *Syncer) downloadGame(game string, cloudVer *time.Time) error {
 
 	_ = os.RemoveAll(backupDir)
 
-	fmt.Println("Done.")
+	s.log("Downloaded %s successfully.", title)
 	return nil
 }
 
@@ -385,7 +483,7 @@ func (s *Syncer) readMetaLocal() (metadata, error) {
 	data, err := os.ReadFile(filepath.Join(s.savePath, metaFileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			fmt.Println("Could not find local metadata file, creating new one")
+			s.log("Could not find local metadata file, creating new one")
 			return meta, nil
 		}
 		return meta, err
@@ -412,7 +510,7 @@ func (s *Syncer) readMetaCloud() (metadata, error) {
 		var noSuchKey *s3types.NoSuchKey
 		var apiErr smithy.APIError
 		if errors.As(err, &noSuchKey) || (errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound")) {
-			fmt.Println("Metadata does not exist yet:", metaFileName)
+			s.log("Metadata does not exist yet: %s", metaFileName)
 			return meta, nil
 		}
 
