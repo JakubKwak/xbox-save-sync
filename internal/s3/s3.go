@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,7 +24,12 @@ type Store struct {
 func New(bucket string, prefix string, region string) (*Store, error) {
 	ctx := context.Background()
 
-	sdkConfig, err := config.LoadDefaultConfig(ctx)
+	var opts []func(*config.LoadOptions) error
+	if region != "" {
+		opts = append(opts, config.WithRegion(region))
+	}
+
+	sdkConfig, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -32,17 +38,24 @@ func New(bucket string, prefix string, region string) (*Store, error) {
 	return &Store{
 		client:  s3Client,
 		bucket:  bucket,
-		prefix:  prefix,
+		prefix:  strings.Trim(prefix, "/"),
 		region:  region,
-		timeout: 30 * time.Second,
+		timeout: 5 * time.Minute,
 	}, nil
+}
+
+func (s *Store) key(filename string) string {
+	if s.prefix == "" {
+		return filename
+	}
+	return s.prefix + "/" + filename
 }
 
 func (s *Store) Download(filename string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	key := s.prefix + "/" + filename
+	key := s.key(filename)
 
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -69,7 +82,7 @@ func (s *Store) Upload(filename string, data []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	key := s.prefix + "/" + filename
+	key := s.key(filename)
 	length := int64(len(data))
 	reader := bytes.NewReader(data)
 

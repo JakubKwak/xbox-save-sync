@@ -5,15 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"xbox-save-sync/internal/mapping"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-
-	"time"
+	"github.com/aws/smithy-go"
 )
 
 const metaFileName string = "meta.json"
@@ -38,7 +37,45 @@ func New(store store, savePath string) *Syncer {
 	return &Syncer{store: store, savePath: savePath}
 }
 
+func isGameDir(name string) bool {
+	if strings.EqualFold(name, baseGameId) {
+		return false
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".bak") || strings.Contains(name, "-tmp-") {
+		return false
+	}
+	// Xenia title IDs are 8-character hexadecimal strings
+	if len(name) != 8 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Syncer) cleanStaleArtifacts() {
+	entries, err := os.ReadDir(s.savePath)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.Contains(name, "-tmp-") || strings.HasSuffix(name, ".bak") {
+			_ = os.RemoveAll(filepath.Join(s.savePath, name))
+		}
+	}
+}
+
 func (s *Syncer) Sync() error {
+	if err := os.MkdirAll(s.savePath, 0755); err != nil {
+		return fmt.Errorf("ensuring save directory: %w", err)
+	}
+
+	s.cleanStaleArtifacts()
+
 	metaLocal, err := s.readMetaLocal()
 	if err != nil {
 		return err
@@ -50,17 +87,16 @@ func (s *Syncer) Sync() error {
 	}
 
 	// Read local folders - if any game does not exist in the local meta.json add it
-	entires, err := os.ReadDir(s.savePath)
+	entries, err := os.ReadDir(s.savePath)
 	if err != nil {
 		return err
 	}
-	for _, entry := range entires {
+	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		game := entry.Name()
-		if game == baseGameId {
-			// base xbox profile game id, reserved for accounts info, skip
+		if !isGameDir(game) {
 			continue
 		}
 		if _, ok := metaLocal.Games[game]; !ok {
@@ -68,132 +104,190 @@ func (s *Syncer) Sync() error {
 		}
 	}
 
-	if err := s.syncExisting(&metaCloud, &metaLocal); err != nil {
-		return err
-	}
-	if err := s.syncNew(&metaCloud, &metaLocal); err != nil {
-		return err
-	}
+	existingErr := s.syncExisting(&metaCloud, &metaLocal)
+	newErr := s.syncNew(&metaCloud, &metaLocal)
 
-	return nil
+	if existingErr != nil {
+		return existingErr
+	}
+	return newErr
 }
 
 func (s *Syncer) syncExisting(metaCloud, metaLocal *metadata) error {
+	var errs []string
 	for game, cloudVer := range metaCloud.Games {
-		if game == baseGameId {
-			// base xbox profile game id, reserved for accounts info, skip
+		if !isGameDir(game) {
 			continue
 		}
 
 		var localVer *time.Time
-		if ver, ok := metaLocal.Games[game]; ok {
+		if ver, ok := metaLocal.Games[game]; ok && !ver.IsZero() {
 			localVer = &ver
 		}
 		newVer, err := s.syncGame(game, &cloudVer, localVer)
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Sprintf("%s: %s", game, err.Error()))
+			fmt.Printf("Error syncing %s: %s\n", mapping.Title(game), err)
+			continue
 		}
 
 		if newVer != nil {
 			metaCloud.Games[game] = *newVer
 			metaLocal.Games[game] = *newVer
-		}
 
-		// Sync metadata between each operation in case of error
-		if err := s.writeMetaCloud(*metaCloud); err != nil {
-			return err
-		}
-		if err := s.writeMetaLocal(*metaLocal); err != nil {
-			return err
+			if err := s.writeMetaCloud(*metaCloud); err != nil {
+				return fmt.Errorf("saving cloud metadata: %w", err)
+			}
+			if err := s.writeMetaLocal(*metaLocal); err != nil {
+				return fmt.Errorf("saving local metadata: %w", err)
+			}
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("failed syncing games: %s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 
 func (s *Syncer) syncNew(metaCloud, metaLocal *metadata) error {
+	var errs []string
 	for game, localVer := range metaLocal.Games {
+		if !isGameDir(game) {
+			continue
+		}
 		if _, ok := metaCloud.Games[game]; ok {
 			continue // If already exists in cloud saves, skip it
 		}
-		newVer, err := s.syncGame(game, nil, &localVer)
+		var lVer *time.Time
+		if !localVer.IsZero() {
+			lVer = &localVer
+		}
+		newVer, err := s.syncGame(game, nil, lVer)
 		if err != nil {
-			return err
+			errs = append(errs, fmt.Sprintf("%s: %s", game, err.Error()))
+			fmt.Printf("Error syncing %s: %s\n", mapping.Title(game), err)
+			continue
 		}
 
 		if newVer != nil {
 			metaCloud.Games[game] = *newVer
 			metaLocal.Games[game] = *newVer
-		}
 
-		// Sync metadata between each operation in case of error
-		if err := s.writeMetaCloud(*metaCloud); err != nil {
-			return err
-		}
-		if err := s.writeMetaLocal(*metaLocal); err != nil {
-			return err
+			if err := s.writeMetaCloud(*metaCloud); err != nil {
+				return fmt.Errorf("saving cloud metadata: %w", err)
+			}
+			if err := s.writeMetaLocal(*metaLocal); err != nil {
+				return fmt.Errorf("saving local metadata: %w", err)
+			}
 		}
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("failed syncing games: %s", strings.Join(errs, "; "))
+	}
 	return nil
 }
 
 func (s *Syncer) syncGame(game string, cloudVer *time.Time, localVer *time.Time) (*time.Time, error) {
-	fmt.Println("Syncing game " + mapping.Title(game))
+	title := mapping.Title(game)
+	fmt.Println("Syncing game " + title)
 
-	if cloudVer == nil && localVer == nil {
-		return nil, errors.New("both cloud and local saves lack version")
-	}
+	saveDir := filepath.Join(s.savePath, game)
+	latestLocalWrite, err := getLatestModTime(saveDir)
+	hasLocalFiles := err == nil && !latestLocalWrite.IsZero()
+	hasCloud := cloudVer != nil && !cloudVer.IsZero()
+	hasLocalVer := localVer != nil && !localVer.IsZero()
 
-	if localVer == nil {
-		if err := s.downloadGame(game); err != nil {
+	// Case 1: Game exists in cloud, but no local files or no prior local sync
+	if hasCloud && (!hasLocalFiles || !hasLocalVer) {
+		if hasLocalFiles {
+			// Both exist, but this device hasn't synced with cloud before. Prompt conflict resolution.
+			return s.promptResolveConflict(game, title, latestLocalWrite, *cloudVer)
+		}
+		if err := s.downloadGame(game, cloudVer); err != nil {
 			return nil, err
 		}
-
 		return cloudVer, nil
 	}
 
-	if cloudVer == nil || cloudVer.Format(time.RFC3339) == localVer.Format(time.RFC3339) {
-		saveDir := filepath.Join(s.savePath, game)
-		latestLocalWrite, err := getLatestModTime(saveDir)
-		if err == nil && localVer != nil && !latestLocalWrite.After(*localVer) {
-			fmt.Println("No change detected for " + mapping.Title(game) + ". Skipping.")
-			return localVer, nil
-		}
-
+	// Case 2: Game exists only locally (new game, no cloud save yet)
+	if !hasCloud && hasLocalFiles {
 		if err := s.uploadGame(game); err != nil {
 			return nil, err
 		}
-
-		ver := time.Now()
+		ver := time.Now().UTC()
 		return &ver, nil
 	}
 
+	// Case 3: Neither cloud nor local has save files
+	if !hasCloud && !hasLocalFiles {
+		return nil, nil
+	}
+
+	// Case 4: Both exist and were previously synced
+	localModified := latestLocalWrite.After(*localVer)
+	cloudChanged := !cloudVer.Equal(*localVer)
+
+	if !localModified && !cloudChanged {
+		fmt.Println("No change detected for " + title + ". Skipping.")
+		return nil, nil
+	}
+
+	if localModified && !cloudChanged {
+		if err := s.uploadGame(game); err != nil {
+			return nil, err
+		}
+		ver := time.Now().UTC()
+		return &ver, nil
+	}
+
+	if !localModified && cloudChanged {
+		if err := s.downloadGame(game, cloudVer); err != nil {
+			return nil, err
+		}
+		return cloudVer, nil
+	}
+
+	// True conflict: both modified since last sync
+	return s.promptResolveConflict(game, title, latestLocalWrite, *cloudVer)
+}
+
+func (s *Syncer) promptResolveConflict(game, title string, localTime, cloudTime time.Time) (*time.Time, error) {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("Version mismatch - Local: %s, Cloud: %s\n", localVer.Format(time.RFC1123), cloudVer.Format(time.RFC1123))
-	fmt.Println("Download (Y) - Upload (X) - Cancel (B)")
+	fmt.Printf("\nConflict detected for %s:\n", title)
+	fmt.Printf("  Local save modified: %s\n", localTime.Local().Format(time.RFC1123))
+	fmt.Printf("  Cloud save uploaded: %s\n", cloudTime.Local().Format(time.RFC1123))
+	fmt.Println("  Download (Y/D) - Upload (X/U) - Cancel (B/C)")
 
 	for {
-		text, _ := reader.ReadString('\n')
-		text = strings.ToUpper(text)
+		fmt.Print("Choice (Y/X/B): ")
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("reading input: %w", err)
+		}
+		text = strings.TrimSpace(strings.ToUpper(text))
+		if len(text) == 0 {
+			continue
+		}
 		character := text[0]
 		switch character {
-		case 'Y':
-			if err := s.downloadGame(game); err != nil {
+		case 'Y', 'D':
+			if err := s.downloadGame(game, &cloudTime); err != nil {
 				return nil, err
 			}
-
-			return cloudVer, nil
-		case 'X':
+			return &cloudTime, nil
+		case 'X', 'U':
 			if err := s.uploadGame(game); err != nil {
 				return nil, err
 			}
-			ver := time.Now()
+			ver := time.Now().UTC()
 			return &ver, nil
-		case 'B':
+		case 'B', 'C', 'Q':
+			fmt.Println("Skipped.")
 			return nil, nil
 		default:
-			fmt.Printf("Unknown input: %s", text)
+			fmt.Printf("Unknown input: %s\n", text)
 		}
 	}
 }
@@ -208,12 +302,15 @@ func (s *Syncer) uploadGame(game string) error {
 		return fmt.Errorf("cannot zip save: %w", err)
 	}
 
-	fmt.Println("Done.")
+	if err := s.store.Upload(game+".zip", data); err != nil {
+		return fmt.Errorf("cannot upload save: %w", err)
+	}
 
-	return s.store.Upload(game+".zip", data)
+	fmt.Println("Done.")
+	return nil
 }
 
-func (s *Syncer) downloadGame(game string) error {
+func (s *Syncer) downloadGame(game string, cloudVer *time.Time) error {
 	fmt.Println("Downloading...")
 
 	zipData, err := s.store.Download(game + ".zip")
@@ -223,8 +320,18 @@ func (s *Syncer) downloadGame(game string) error {
 
 	targetDir := filepath.Join(s.savePath, game)
 
+	// Clean up any stale temp directories matching this game
+	tmpPrefix := game + "-tmp-"
+	if entries, err := os.ReadDir(s.savePath); err == nil {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), tmpPrefix) {
+				_ = os.RemoveAll(filepath.Join(s.savePath, entry.Name()))
+			}
+		}
+	}
+
 	// We extract to a temporary folder first to avoid corrupting local saves if sync breaks midway
-	tmpDir, err := os.MkdirTemp(s.savePath, game+"-tmp-")
+	tmpDir, err := os.MkdirTemp(s.savePath, tmpPrefix)
 	if err != nil {
 		return fmt.Errorf("cannot make temp dir: %w", err)
 	}
@@ -237,7 +344,7 @@ func (s *Syncer) downloadGame(game string) error {
 	backupDir := targetDir + ".bak"
 	_ = os.RemoveAll(backupDir)
 
-	// Move existing save to backup dir
+	// Move existing save to backup dir if it exists
 	if _, err := os.Stat(targetDir); err == nil {
 		if err := os.Rename(targetDir, backupDir); err != nil {
 			return fmt.Errorf("cannot backup save: %w", err)
@@ -250,50 +357,84 @@ func (s *Syncer) downloadGame(game string) error {
 		return fmt.Errorf("cannot move new save: %w", err)
 	}
 
+	// Clamp extracted files' mtime to cloudVer to prevent false upload triggers
+	if cloudVer != nil && !cloudVer.IsZero() {
+		_ = clampModTime(targetDir, *cloudVer)
+	}
+
 	_ = os.RemoveAll(backupDir)
 
 	fmt.Println("Done.")
 	return nil
 }
 
+func clampModTime(dirPath string, maxTime time.Time) error {
+	return filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && info.ModTime().After(maxTime) {
+			_ = os.Chtimes(path, maxTime, maxTime)
+		}
+		return nil
+	})
+}
+
 func (s *Syncer) readMetaLocal() (metadata, error) {
-	file, err := os.Open(filepath.Join(s.savePath, metaFileName))
+	meta := metadata{Games: make(map[string]time.Time)}
+	data, err := os.ReadFile(filepath.Join(s.savePath, metaFileName))
 	if err != nil {
-		fmt.Println("Could not find/open metadata file, creating new one")
-		return metadata{Games: map[string]time.Time{}}, nil
+		if os.IsNotExist(err) {
+			fmt.Println("Could not find local metadata file, creating new one")
+			return meta, nil
+		}
+		return meta, err
 	}
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return metadata{Games: map[string]time.Time{}}, err
+	if len(data) == 0 {
+		return meta, nil
 	}
 
-	meta := metadata{Games: map[string]time.Time{}}
-	err = json.Unmarshal(data, &meta)
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return meta, err
+	}
+	if meta.Games == nil {
+		meta.Games = make(map[string]time.Time)
+	}
 
-	return meta, err
+	return meta, nil
 }
 
 func (s *Syncer) readMetaCloud() (metadata, error) {
+	meta := metadata{Games: make(map[string]time.Time)}
 	data, err := s.store.Download(metaFileName)
 	if err != nil {
-		var noSuchKey *s3types.NoSuchKey // todo not generic
-		if errors.As(err, &noSuchKey) {
+		var noSuchKey *s3types.NoSuchKey
+		var apiErr smithy.APIError
+		if errors.As(err, &noSuchKey) || (errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound")) {
 			fmt.Println("Metadata does not exist yet:", metaFileName)
-			return metadata{Games: map[string]time.Time{}}, nil
+			return meta, nil
 		}
 
-		return metadata{Games: map[string]time.Time{}}, err
+		return meta, err
 	}
 
-	meta := metadata{Games: map[string]time.Time{}}
-	err = json.Unmarshal(data, &meta)
+	if len(data) == 0 {
+		return meta, nil
+	}
 
-	return meta, err
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return meta, err
+	}
+	if meta.Games == nil {
+		meta.Games = make(map[string]time.Time)
+	}
+
+	return meta, nil
 }
 
 func (s *Syncer) writeMetaCloud(meta metadata) error {
-	data, err := json.Marshal(meta)
+	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -302,12 +443,17 @@ func (s *Syncer) writeMetaCloud(meta metadata) error {
 }
 
 func (s *Syncer) writeMetaLocal(meta metadata) error {
-	data, err := json.Marshal(meta)
+	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(s.savePath, metaFileName), data, 0666)
+	targetPath := filepath.Join(s.savePath, metaFileName)
+	tmpPath := targetPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, targetPath)
 }
 
 func getLatestModTime(dirPath string) (time.Time, error) {

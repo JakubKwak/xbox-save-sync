@@ -21,6 +21,9 @@ func zipDir(root string) ([]byte, error) {
 		if info.IsDir() {
 			return nil
 		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 
 		relPath, err := filepath.Rel(root, path)
 		if err != nil {
@@ -28,19 +31,28 @@ func zipDir(root string) ([]byte, error) {
 		}
 		relPath = filepath.ToSlash(relPath)
 
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+		header.Method = zip.Deflate
+
+		w, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
 		file, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-
-		w, err := zipWriter.Create(relPath)
-		if err != nil {
-			return err
+		_, copyErr := io.Copy(w, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
 		}
-
-		_, err = io.Copy(w, file)
-		return err
+		return closeErr
 	})
 
 	if err != nil {
@@ -61,12 +73,13 @@ func unzip(data []byte, dest string) error {
 		return err
 	}
 
-	for _, file := range reader.File {
-		// Convert ZIP path separators to OS-specific ones
-		cleanName := filepath.FromSlash(file.Name)
-		path := filepath.Join(dest, cleanName)
+	cleanDest := filepath.Clean(dest)
 
-		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
+	for _, file := range reader.File {
+		cleanName := filepath.FromSlash(file.Name)
+		path := filepath.Join(cleanDest, cleanName)
+
+		if !strings.HasPrefix(path, cleanDest+string(os.PathSeparator)) && path != cleanDest {
 			return fmt.Errorf("illegal file path: %s", file.Name)
 		}
 
@@ -81,23 +94,37 @@ func unzip(data []byte, dest string) error {
 			return err
 		}
 
+		mode := file.Mode()
+		// Ensure file has at least read/write permissions for user
+		if mode&0600 == 0 {
+			mode = 0644
+		}
+
+		out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+		if err != nil {
+			return err
+		}
+
 		in, err := file.Open()
 		if err != nil {
+			out.Close()
 			return err
 		}
 
-		out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, file.Mode())
-		if err != nil {
-			in.Close()
-			return err
-		}
-
-		_, err = io.Copy(out, in)
+		_, copyErr := io.Copy(out, in)
 		in.Close()
-		out.Close()
+		closeErr := out.Close()
 
-		if err != nil {
-			return err
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+
+		// Restore modification time
+		if !file.Modified.IsZero() {
+			_ = os.Chtimes(path, file.Modified, file.Modified)
 		}
 	}
 

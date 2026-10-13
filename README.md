@@ -2,7 +2,7 @@
 
 A simple tool for syncing Xenia emulator saves between devices using AWS S3.
 
-Designed to allow sumple cloud saves between PC and Steam Deck.
+Designed to allow simple cloud saves between PC and Steam Deck.
 
 To build on Windows:
 ```
