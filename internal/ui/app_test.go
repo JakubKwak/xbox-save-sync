@@ -1,8 +1,14 @@
 package ui
 
 import (
+	"errors"
+	"image"
 	"testing"
 	"time"
+
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/unit"
 
 	appSync "xbox-save-sync/internal/sync"
 )
@@ -61,4 +67,66 @@ func TestUINew(t *testing.T) {
 		t.Fatalf("timed out waiting for conflict resolution")
 	}
 }
+
+func TestStartSyncDoesNotDeadlock(t *testing.T) {
+	tempDir := t.TempDir()
+	syncer := appSync.New(&mockStore{}, tempDir)
+	app := New(syncer, tempDir, "my-bucket", "user", "us-east-1")
+
+	// Trigger sync
+	app.startSync()
+
+	// Wait for sync to complete (should be fast with mockStore)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		app.mu.Lock()
+		syncing := app.isSyncing
+		msg := app.statusMsg
+		app.mu.Unlock()
+
+		if !syncing {
+			if msg != "All saves are up to date!" {
+				t.Fatalf("expected status 'All saves are up to date!', got %q", msg)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for sync to finish (possible deadlock)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSetInitError(t *testing.T) {
+	app := New(nil, "/test/dir", "my-bucket", "user", "us-east-1")
+	app.SetInitError(errors.New("test error"))
+
+	if !app.statusIsError {
+		t.Errorf("expected statusIsError to be true")
+	}
+	if len(app.logs) == 0 {
+		t.Errorf("expected logs to contain error")
+	}
+}
+
+func TestDrawCardDimensions(t *testing.T) {
+	var ops op.Ops
+	gtx := layout.Context{
+		Ops: &ops,
+		Constraints: layout.Constraints{
+			Max: image.Point{X: 800, Y: 600},
+		},
+	}
+	dims := drawCard(gtx, colorCard, colorCardBorder, unit.Dp(8), layout.UniformInset(unit.Dp(10)), func(gtx layout.Context) layout.Dimensions {
+		return layout.Dimensions{Size: image.Point{X: 200, Y: 30}}
+	})
+	// Inset is 10 on all sides so height is 30 + 20 = 50. Must not be 600!
+	if dims.Size.Y > 60 {
+		t.Fatalf("drawCard returned excessive height: %d, expected ~50", dims.Size.Y)
+	}
+	if dims.Size.X > 230 {
+		t.Fatalf("drawCard returned excessive width: %d, expected ~220", dims.Size.X)
+	}
+}
+
 

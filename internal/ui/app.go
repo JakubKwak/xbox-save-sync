@@ -82,17 +82,20 @@ func New(syncer *appSync.Syncer, saveDir, bucket, prefix, region string) *App {
 		configOK:     configOK,
 		theme:        th,
 		statusMsg:    "Ready to sync",
-		logList:      widget.List{List: layout.List{Axis: layout.Vertical}},
+		logList:      widget.List{List: layout.List{Axis: layout.Vertical, ScrollToEnd: true}},
 		logs:         make([]string, 0),
-		conflictChan: make(chan appSync.ConflictChoice),
+		conflictChan: make(chan appSync.ConflictChoice, 1),
 	}
 
 	if syncer != nil {
 		syncer.SetLogger(func(format string, args ...any) {
-			a.addLog(fmt.Sprintf(format, args...))
+			msg := fmt.Sprintf(format, args...)
+			fmt.Println(msg)
+			a.addLog(msg)
 		})
 
 		syncer.SetProgressCallback(func(gameTitle, action string) {
+			fmt.Printf("[%s] %s\n", gameTitle, action)
 			a.mu.Lock()
 			a.currentGame = fmt.Sprintf("%s (%s)", gameTitle, action)
 			a.mu.Unlock()
@@ -104,19 +107,41 @@ func New(syncer *appSync.Syncer, saveDir, bucket, prefix, region string) *App {
 		syncer.SetConflictResolver(func(info appSync.ConflictInfo) (appSync.ConflictChoice, error) {
 			return a.promptConflict(info)
 		})
+	} else if configOK {
+		a.statusMsg = "Failed to initialize syncer"
+		a.statusIsError = true
+		a.addLogLocked("ERROR: Failed to initialize AWS S3 syncer")
 	}
 
 	return a
 }
 
-func (a *App) addLog(msg string) {
+func (a *App) SetInitError(err error) {
+	if err == nil {
+		return
+	}
 	a.mu.Lock()
+	a.statusMsg = fmt.Sprintf("Initialization error: %v", err)
+	a.statusIsError = true
+	a.addLogLocked(fmt.Sprintf("ERROR: %v", err))
+	a.mu.Unlock()
+	if a.window != nil {
+		a.window.Invalidate()
+	}
+}
+
+func (a *App) addLogLocked(msg string) {
 	timestamp := time.Now().Format("15:04:05")
 	a.logs = append(a.logs, fmt.Sprintf("[%s] %s", timestamp, msg))
 	// Keep maximum 200 log messages in memory
 	if len(a.logs) > 200 {
 		a.logs = a.logs[len(a.logs)-200:]
 	}
+}
+
+func (a *App) addLog(msg string) {
+	a.mu.Lock()
+	a.addLogLocked(msg)
 	a.mu.Unlock()
 
 	if a.window != nil {
@@ -160,6 +185,11 @@ func (a *App) Run() error {
 	)
 	a.window = w
 
+	// Automatically start syncing on launch if configuration is valid and syncer initialized
+	if a.configOK && a.syncer != nil {
+		a.startSync()
+	}
+
 	var ops op.Ops
 
 	for {
@@ -185,7 +215,14 @@ func (a *App) startSync() {
 	a.statusMsg = "Syncing in progress..."
 	a.statusIsError = false
 	a.currentGame = "Starting..."
+	a.addLogLocked("Starting sync...")
 	a.mu.Unlock()
+
+	fmt.Println("Starting sync...")
+
+	if a.window != nil {
+		a.window.Invalidate()
+	}
 
 	go func() {
 		err := a.syncer.Sync()
@@ -196,11 +233,13 @@ func (a *App) startSync() {
 		if err != nil {
 			a.statusMsg = fmt.Sprintf("Sync failed: %v", err)
 			a.statusIsError = true
-			a.addLog(fmt.Sprintf("ERROR: %v", err))
+			a.addLogLocked(fmt.Sprintf("ERROR: %v", err))
+			fmt.Printf("Sync failed: %v\n", err)
 		} else {
 			a.statusMsg = "All saves are up to date!"
 			a.statusIsError = false
-			a.addLog("Sync completed successfully.")
+			a.addLogLocked("Sync completed successfully.")
+			fmt.Println("Sync completed successfully.")
 		}
 		a.mu.Unlock()
 
@@ -539,13 +578,12 @@ func (a *App) layoutLogsCard(gtx layout.Context) layout.Dimensions {
 }
 
 func drawCard(gtx layout.Context, bg, border color.NRGBA, radius unit.Dp, in layout.Inset, w layout.Widget) layout.Dimensions {
-	r := gtx.Dp(radius)
-	borderRect := clip.UniformRRect(image.Rect(0, 0, gtx.Constraints.Max.X, gtx.Constraints.Max.Y), r)
-
 	return layout.Stack{}.Layout(gtx,
 		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			r := gtx.Dp(radius)
+			borderRect := clip.UniformRRect(image.Rect(0, 0, gtx.Constraints.Min.X, gtx.Constraints.Min.Y), r)
 			paint.FillShape(gtx.Ops, bg, borderRect.Op(gtx.Ops))
-			return layout.Dimensions{Size: gtx.Constraints.Max}
+			return layout.Dimensions{Size: gtx.Constraints.Min}
 		}),
 		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
 			return in.Layout(gtx, w)

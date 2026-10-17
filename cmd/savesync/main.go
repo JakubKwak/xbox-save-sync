@@ -52,9 +52,11 @@ func main() {
 	}
 
 	var syncer *sync.Syncer
+	var initErr error
 	if bucket != "" && saveDir != "" {
 		store, err := s3.New(bucket, prefix, region)
 		if err != nil {
+			initErr = err
 			log.Printf("Error creating S3 Store: %v\n", err)
 		} else {
 			syncer = sync.New(store, saveDir)
@@ -71,7 +73,11 @@ func main() {
 			os.Exit(1)
 		}
 		if syncer == nil {
-			fmt.Fprintln(os.Stderr, "Error initializing syncer")
+			if initErr != nil {
+				fmt.Fprintf(os.Stderr, "Error initializing syncer: %v\n", initErr)
+			} else {
+				fmt.Fprintln(os.Stderr, "Error initializing syncer")
+			}
 			os.Exit(1)
 		}
 
@@ -84,6 +90,9 @@ func main() {
 
 	// Default: Launch Gio graphical UI
 	gui := ui.New(syncer, saveDir, bucket, prefix, region)
+	if initErr != nil {
+		gui.SetInitError(initErr)
+	}
 	go func() {
 		if err := gui.Run(); err != nil {
 			log.Printf("UI Error: %v\n", err)
